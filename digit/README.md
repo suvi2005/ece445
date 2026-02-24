@@ -1,2 +1,2 @@
-DIGIT: Digital Gesture Interface for Teleoperation
+DIGIT: Digital Interactive Gesture Interface for Teleoperation
 
