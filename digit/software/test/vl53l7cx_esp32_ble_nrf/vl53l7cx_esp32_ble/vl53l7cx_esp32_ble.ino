@@ -33,8 +33,8 @@ Adafruit_NeoPixel rgb(RGB_LED_COUNT, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 static const char *TARGET_DEVICE_NAME = "Feather52832_UART";
 
 static BLEUUID SERVICE_UUID("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
-static BLEUUID RX_CHAR_UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E"); // write to nRF
-static BLEUUID TX_CHAR_UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E"); // notify from nRF
+static BLEUUID RX_CHAR_UUID("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+static BLEUUID TX_CHAR_UUID("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
 
 // =========================
 // Lidar settings
@@ -49,24 +49,21 @@ BLEAdvertisedDevice *targetDevice = nullptr;
 BLEClient *pClient = nullptr;
 BLERemoteCharacteristic *pRemoteRx = nullptr;
 BLERemoteCharacteristic *pRemoteTx = nullptr;
+BLEScan *pScan = nullptr;
 
 bool bleConnected = false;
 bool doConnect = false;
+bool scanInProgress = false;
 
 // =========================
 // Runtime state
 // =========================
-String rxLine = "";
-String lastAck = "NONE";
-String lastNrfState = "NONE";
-
 uint32_t txCount = 0;
-uint32_t rxCount = 0;
 uint32_t noTargetCount = 0;
 
-unsigned long lastStatusSendMs = 0;
 unsigned long lastScreenRefreshMs = 0;
 unsigned long lastLedBlinkMs = 0;
+unsigned long lastScanAttemptMs = 0;
 
 bool ledBlinkState = false;
 
@@ -75,10 +72,10 @@ bool haveAverage = false;
 uint16_t lastAvgDistanceMm = 0;
 VL53L7CX_ResultsData lastResults;
 
-static const uint32_t STATUS_SEND_INTERVAL_MS = 1000;
 static const uint32_t SCREEN_REFRESH_INTERVAL_MS = 80;
-static const uint32_t LED_BLINK_INTERVAL_MS = 180;
+static const uint32_t LED_BLINK_INTERVAL_MS = 60;
 static const uint32_t SCAN_DURATION_SECONDS = 5;
+static const uint32_t SCAN_RETRY_INTERVAL_MS = 1000;
 
 // =========================
 // Forward declarations
@@ -87,53 +84,40 @@ bool initLidar();
 void initStatusLed();
 void setStatusLed(uint8_t r, uint8_t g, uint8_t b);
 void updateStatusLed();
+
 void startScan();
 bool connectToServer();
+void cleanupConnection(bool deleteClient);
 void sendMessage(const String &msg);
-void handleIncomingLine(const String &line);
+
 uint8_t getGridSize(uint8_t resolution);
 uint16_t getPrimaryDistanceForZone(VL53L7CX_ResultsData *results, uint8_t zone);
 bool computeAverageDistanceMm(VL53L7CX_ResultsData *results, uint8_t resolution, uint16_t &avgDistanceMm);
+
 void printDivider(uint8_t gridSize);
 void printDistanceGrid(VL53L7CX_ResultsData *results, uint8_t resolution);
 void redrawScreen();
 void printI2CScan();
 
 // =========================
-// BLE notification callback
+// BLE callbacks
 // =========================
-static void notifyCallback(
-    BLERemoteCharacteristic *pBLERemoteCharacteristic,
-    uint8_t *pData,
-    size_t length,
-    bool isNotify) {
-  (void)pBLERemoteCharacteristic;
-  (void)isNotify;
-
-  for (size_t i = 0; i < length; i++) {
-    char c = (char)pData[i];
-
-    if (c == '\r') {
-      continue;
-    }
-
-    if (c == '\n') {
-      if (rxLine.length() > 0) {
-        handleIncomingLine(rxLine);
-        rxLine = "";
-      }
-    } else {
-      rxLine += c;
-      if (rxLine.length() > 128) {
-        rxLine = "";
-      }
-    }
+class MyClientCallbacks : public BLEClientCallbacks {
+  void onConnect(BLEClient *client) override {
+    SerialPort.println("BLE client connected");
   }
-}
 
-// =========================
-// BLE advertised device callback
-// =========================
+  void onDisconnect(BLEClient *client) override {
+    SerialPort.println("BLE client disconnected callback");
+    bleConnected = false;
+    doConnect = false;
+    pRemoteRx = nullptr;
+    pRemoteTx = nullptr;
+    targetDevice = nullptr;
+    lastScanAttemptMs = 0;
+  }
+};
+
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice advertisedDevice) override {
     String name = advertisedDevice.getName().c_str();
@@ -142,9 +126,17 @@ class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
       SerialPort.print("Matched target nRF device: ");
       SerialPort.println(name);
 
+      if (targetDevice != nullptr) {
+        delete targetDevice;
+        targetDevice = nullptr;
+      }
+
       targetDevice = new BLEAdvertisedDevice(advertisedDevice);
       doConnect = true;
-      BLEDevice::getScan()->stop();
+
+      if (pScan != nullptr) {
+        pScan->stop();
+      }
     }
   }
 };
@@ -166,33 +158,44 @@ void setup() {
     SerialPort.println("Lidar init failed. Halting.");
     while (1) {
       updateStatusLed();
+      delay(10);
     }
   }
 
   BLEDevice::init("");
+  pScan = BLEDevice::getScan();
+  pScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pScan->setActiveScan(true);
+  pScan->setInterval(100);
+  pScan->setWindow(80);
+
   startScan();
 }
 
 void loop() {
   updateStatusLed();
 
+  // If client object exists but link dropped, clean up.
+  if (pClient != nullptr && !pClient->isConnected() && bleConnected) {
+    SerialPort.println("BLE disconnected detected in loop");
+    cleanupConnection(true);
+  }
+
+  // Reconnect / rescan logic
   if (!bleConnected) {
     if (doConnect) {
+      doConnect = false;
+
       if (connectToServer()) {
         SerialPort.println("Connected to nRF BLE UART server");
       } else {
-        SerialPort.println("Failed to connect to nRF, rescanning...");
-        bleConnected = false;
-        doConnect = false;
-        targetDevice = nullptr;
-        pRemoteRx = nullptr;
-        pRemoteTx = nullptr;
-        if (pClient != nullptr) {
-          delete pClient;
-          pClient = nullptr;
-        }
-        startScan();
+        SerialPort.println("Failed to connect to nRF, will rescan");
+        cleanupConnection(true);
       }
+    }
+
+    if (!scanInProgress && !doConnect && (millis() - lastScanAttemptMs >= SCAN_RETRY_INTERVAL_MS)) {
+      startScan();
     }
 
     if (millis() - lastScreenRefreshMs >= SCREEN_REFRESH_INTERVAL_MS) {
@@ -200,9 +203,11 @@ void loop() {
       redrawScreen();
     }
 
+    delay(5);
     return;
   }
 
+  // Lidar acquisition and transmit
   VL53L7CX_ResultsData results;
   uint8_t dataReady = 0;
   uint8_t status = sensor_vl53l7cx_top.vl53l7cx_check_data_ready(&dataReady);
@@ -233,45 +238,49 @@ void loop() {
     SerialPort.println(status);
   }
 
-  if (millis() - lastStatusSendMs >= STATUS_SEND_INTERVAL_MS) {
-    lastStatusSendMs = millis();
-    sendMessage("STATE:ESP32_CONNECTED");
-  }
-
   if (pClient != nullptr && !pClient->isConnected()) {
     SerialPort.println("BLE disconnected");
-    bleConnected = false;
-    pRemoteRx = nullptr;
-    pRemoteTx = nullptr;
-    doConnect = false;
-    targetDevice = nullptr;
-    if (pClient != nullptr) {
-      delete pClient;
-      pClient = nullptr;
-    }
-    startScan();
+    cleanupConnection(true);
   }
 
   if (millis() - lastScreenRefreshMs >= SCREEN_REFRESH_INTERVAL_MS) {
     lastScreenRefreshMs = millis();
     redrawScreen();
   }
+
+  delay(2);
 }
 
-void handleIncomingLine(const String &line) {
-  rxCount++;
+void cleanupConnection(bool deleteClient) {
+  bleConnected = false;
+  doConnect = false;
 
-  if (line.startsWith("ACK:")) {
-    lastAck = line;
-  } else if (line.startsWith("STATE:")) {
-    lastNrfState = line;
-  } else if (line == "PING") {
-    sendMessage("PONG");
+  pRemoteRx = nullptr;
+  pRemoteTx = nullptr;
+
+  if (targetDevice != nullptr) {
+    delete targetDevice;
+    targetDevice = nullptr;
   }
+
+  if (deleteClient && pClient != nullptr) {
+    if (pClient->isConnected()) {
+      pClient->disconnect();
+    }
+    delete pClient;
+    pClient = nullptr;
+  }
+
+  if (pScan != nullptr) {
+    pScan->clearResults();
+  }
+
+  scanInProgress = false;
+  lastScanAttemptMs = millis();
 }
 
 void sendMessage(const String &msg) {
-  if (!bleConnected || pRemoteRx == nullptr) {
+  if (!bleConnected || pRemoteRx == nullptr || pClient == nullptr || !pClient->isConnected()) {
     return;
   }
 
@@ -347,10 +356,12 @@ void setStatusLed(uint8_t r, uint8_t g, uint8_t b) {
 
 void updateStatusLed() {
   if (bleConnected) {
+    // solid blue when connected
     setStatusLed(0, 0, 80);
     return;
   }
 
+  // blink blue when disconnected
   if (millis() - lastLedBlinkMs >= LED_BLINK_INTERVAL_MS) {
     lastLedBlinkMs = millis();
     ledBlinkState = !ledBlinkState;
@@ -363,14 +374,22 @@ void updateStatusLed() {
 }
 
 void startScan() {
-  SerialPort.println("Starting BLE scan...");
+  if (bleConnected || pScan == nullptr || scanInProgress) {
+    return;
+  }
 
-  BLEScan *pScan = BLEDevice::getScan();
-  pScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pScan->setActiveScan(true);
-  pScan->setInterval(100);
-  pScan->setWindow(80);
+  SerialPort.println("Starting BLE scan...");
+  scanInProgress = true;
+  lastScanAttemptMs = millis();
+
+  pScan->clearResults();
   pScan->start(SCAN_DURATION_SECONDS, false);
+
+  scanInProgress = false;
+
+  if (!doConnect) {
+    SerialPort.println("Scan ended, target not found");
+  }
 }
 
 bool connectToServer() {
@@ -378,7 +397,13 @@ bool connectToServer() {
     return false;
   }
 
+  if (pClient != nullptr) {
+    delete pClient;
+    pClient = nullptr;
+  }
+
   pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallbacks());
 
   SerialPort.print("Connecting to: ");
   SerialPort.println(targetDevice->getAddress().toString().c_str());
@@ -404,16 +429,8 @@ bool connectToServer() {
     return false;
   }
 
-  if (!pRemoteTx->canNotify()) {
-    SerialPort.println("TX characteristic cannot notify");
-    pClient->disconnect();
-    return false;
-  }
-
-  pRemoteTx->registerForNotify(notifyCallback);
-
   bleConnected = true;
-  doConnect = false;
+  scanInProgress = false;
   return true;
 }
 
@@ -522,21 +539,14 @@ void redrawScreen() {
 
   SerialPort.println("ESP32-C6 BLE client + VL53L7CX fast stream");
   SerialPort.println("------------------------------------------");
+
   SerialPort.print("BLE connected: ");
   SerialPort.println(bleConnected ? "YES" : "NO");
 
   SerialPort.print("TX count: ");
   SerialPort.print(txCount);
-  SerialPort.print("   RX count: ");
-  SerialPort.print(rxCount);
   SerialPort.print("   NO_TARGET count: ");
   SerialPort.println(noTargetCount);
-
-  SerialPort.print("Last ACK: ");
-  SerialPort.println(lastAck);
-
-  SerialPort.print("Last nRF state: ");
-  SerialPort.println(lastNrfState);
 
   SerialPort.print("Average distance mm sent to nRF: ");
   if (haveAverage) {

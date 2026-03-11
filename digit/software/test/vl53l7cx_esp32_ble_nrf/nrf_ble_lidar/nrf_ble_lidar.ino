@@ -6,7 +6,6 @@ void startAdv(void);
 void connect_callback(uint16_t conn_handle);
 void disconnect_callback(uint16_t conn_handle, uint8_t reason);
 void updateRedLedBehavior();
-void sendMessage(const String &msg);
 void handleIncomingLine(const String &line);
 void redrawScreen();
 const char *getRangeLabel();
@@ -20,10 +19,10 @@ uint32_t getBlinkIntervalForDistance(uint16_t distanceMm);
 // =========================
 // Blink thresholds
 // =========================
-static const uint16_t RANGE_VERY_CLOSE_MM = 250;
-static const uint16_t RANGE_CLOSE_MM = 500;
-static const uint16_t RANGE_MEDIUM_MM = 900;
-static const uint16_t RANGE_FAR_MM = 1400;
+static const uint16_t RANGE_VERY_CLOSE_MM = 200;
+static const uint16_t RANGE_CLOSE_MM = 400;
+static const uint16_t RANGE_MEDIUM_MM = 800;
+static const uint16_t RANGE_FAR_MM = 1000;
 
 static const uint32_t BLINK_VERY_FAST_MS = 40;
 static const uint32_t BLINK_FAST_MS = 90;
@@ -31,11 +30,10 @@ static const uint32_t BLINK_MEDIUM_MS = 160;
 static const uint32_t BLINK_SLOW_MS = 260;
 
 // =========================
-// Timeout/status config
+// Timeout / refresh config
 // =========================
 static const uint32_t DATA_TIMEOUT_MS = 1200;
-static const uint32_t STATUS_SEND_INTERVAL_MS = 1000;
-static const uint32_t SCREEN_REFRESH_INTERVAL_MS = 60;
+static const uint32_t SCREEN_REFRESH_INTERVAL_MS = 100;
 
 // =========================
 // Runtime state
@@ -49,15 +47,12 @@ unsigned long lastDistanceRxMs = 0;
 
 unsigned long lastRedToggleMs = 0;
 bool redLedState = false;
-unsigned long lastStatusMs = 0;
 unsigned long lastScreenRefreshMs = 0;
 
 uint32_t currentBlinkIntervalMs = BLINK_SLOW_MS;
 bool targetCurrentlyInRange = false;
 uint32_t rxCount = 0;
-uint32_t txCount = 0;
 String lastRxLine = "NONE";
-String lastTxLine = "NONE";
 String connectionState = "ADVERTISING";
 
 void setup() {
@@ -98,15 +93,10 @@ void loop() {
       }
     } else {
       rxLine += c;
-      if (rxLine.length() > 128) {
+      if (rxLine.length() > 64) {
         rxLine = "";
       }
     }
-  }
-
-  if (bleConnected && millis() - lastStatusMs >= STATUS_SEND_INTERVAL_MS) {
-    lastStatusMs = millis();
-    sendMessage("STATE:NRF_CONNECTED");
   }
 
   updateRedLedBehavior();
@@ -140,7 +130,6 @@ void handleIncomingLine(const String &line) {
         lastRedToggleMs = millis();
       }
 
-      sendMessage("ACK:DIST:" + String(latestDistanceMm));
       redrawScreen();
     }
     return;
@@ -156,32 +145,9 @@ void handleIncomingLine(const String &line) {
     digitalWrite(RED_LED_PIN, LOW);
     redLedState = false;
 
-    sendMessage("ACK:NO_TARGET");
     redrawScreen();
     return;
   }
-
-  if (line.startsWith("STATE:")) {
-    sendMessage("ACK:STATE");
-    redrawScreen();
-    return;
-  }
-
-  if (line == "PING") {
-    sendMessage("PONG");
-    redrawScreen();
-    return;
-  }
-}
-
-void sendMessage(const String &msg) {
-  if (!bleConnected) {
-    return;
-  }
-
-  bleuart.println(msg);
-  txCount++;
-  lastTxLine = msg;
 }
 
 uint32_t getBlinkIntervalForDistance(uint16_t distanceMm) {
@@ -261,15 +227,10 @@ void redrawScreen() {
   Serial.println(bleConnected ? "YES" : "NO");
 
   Serial.print("RX count: ");
-  Serial.print(rxCount);
-  Serial.print("   TX count: ");
-  Serial.println(txCount);
+  Serial.println(rxCount);
 
   Serial.print("Last RX: ");
   Serial.println(lastRxLine);
-
-  Serial.print("Last TX: ");
-  Serial.println(lastTxLine);
 
   Serial.print("Latest distance mm: ");
   if (haveRecentDistance) {
@@ -329,7 +290,6 @@ void connect_callback(uint16_t conn_handle) {
   currentBlinkIntervalMs = BLINK_SLOW_MS;
   targetCurrentlyInRange = false;
   lastRxLine = "CONNECTED";
-  lastTxLine = "NONE";
   connectionState = String("CONNECTED TO ") + central_name;
 
   redrawScreen();
