@@ -9,9 +9,11 @@
 #include <esp_eap_client.h>
 
 #include <BLEDevice.h>
-#include <BLEServer.h>
 #include <BLEUtils.h>
-#include <BLE2902.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <BLERemoteCharacteristic.h>
+#include <BLERemoteService.h>
 
 // ===================
 // Select camera model
@@ -21,15 +23,20 @@
 
 // =========================
 // BLE configuration
+// Must match the transmitting ESP32
 // =========================
-static const char* DEVICE_NAME = "ESP32-S3 Robot";
-static const char* SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
-static const char* CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+#define BLE_DEVICE_NAME          "ESP32S3_GLOVE"
+#define BLE_SERVICE_UUID         "12345678-1234-1234-1234-1234567890ab"
+#define BLE_CHARACTERISTIC_UUID  "abcdefab-1234-1234-1234-abcdefabcdef"
 
-BLEServer* pServer = nullptr;
-BLECharacteristic* pCharacteristic = nullptr;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
+// BLE client state
+static BLEAdvertisedDevice* myDevice = nullptr;
+static BLERemoteCharacteristic* pRemoteCharacteristic = nullptr;
+static BLEClient* pClient = nullptr;
+
+bool doConnect = false;
+bool connected = false;
+bool doScan = false;
 
 // =========================
 // Pin configuration
@@ -42,8 +49,8 @@ bool oldDeviceConnected = false;
 #define PWMB 48
 #define STBY 100
 
-#define SDA_PIN 1
-#define SCL_PIN 2
+#define SDA_PIN 2
+#define SCL_PIN 1
 
 // =========================
 // Stream verification
@@ -75,7 +82,7 @@ Motor motor1 = Motor(AIN1, AIN2, PWMA, offsetA, STBY, 5000, 8, 1);
 Motor motor2 = Motor(BIN1, BIN2, PWMB, offsetB, STBY, 5000, 8, 2);
 
 const int DRIVE_SPEED = 180;
-char currentCommand = ' ';
+char currentCommand = 'x';   // x means stop internally
 const uint16_t BRAKE_DISTANCE_MM = 100;
 
 Adafruit_VL53L0X lox = Adafruit_VL53L0X();
@@ -99,7 +106,9 @@ void setupLedFlash(int pin);
 void stopRobot();
 void applyCommand(char cmd);
 void readLidarAndEnforceBrake();
-void handleBleCommand(String value);
+void handleBleValue(String value);
+void startBleScan();
+bool connectToBleServer();
 
 // =========================
 // Verification helpers
@@ -188,40 +197,140 @@ void printVerificationReport() {
 }
 
 // =========================
-// BLE callbacks
+// BLE client callbacks
 // =========================
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) override {
-    deviceConnected = true;
-    Serial.println("BLE client connected");
+static void notifyCallback(
+  BLERemoteCharacteristic* pBLERemoteCharacteristic,
+  uint8_t* pData,
+  size_t length,
+  bool isNotify
+) {
+  if (length == 0) return;
+
+  String value = "";
+  for (size_t i = 0; i < length; i++) {
+    value += (char)pData[i];
   }
 
-  void onDisconnect(BLEServer* pServer) override {
-    deviceConnected = false;
-    Serial.println("BLE client disconnected");
+  Serial.print("Received over BLE: ");
+  Serial.println(value);
+
+  handleBleValue(value);
+}
+
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) override {
+    Serial.println("Connected to BLE transmitter");
+  }
+
+  void onDisconnect(BLEClient* pclient) override {
+    connected = false;
+    Serial.println("Disconnected from BLE transmitter");
     stopRobot();
-    currentCommand = ' ';
+    currentCommand = 'x';
   }
 };
 
-class MyCharacteristicCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pCharacteristic) override {
-    String value = pCharacteristic->getValue();
+class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) override {
+    bool nameMatch = advertisedDevice.haveName() &&
+                     advertisedDevice.getName() == BLE_DEVICE_NAME;
 
-    if (value.length() == 0) {
-      return;
+    bool serviceMatch = advertisedDevice.haveServiceUUID() &&
+                        advertisedDevice.isAdvertisingService(BLEUUID(BLE_SERVICE_UUID));
+
+    if (nameMatch || serviceMatch) {
+      Serial.println("Found target BLE transmitter");
+
+      if (advertisedDevice.haveName()) {
+        Serial.print("Name: ");
+        Serial.println(advertisedDevice.getName().c_str());
+      }
+
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+      doScan = false;
     }
-
-    Serial.print("Received over BLE: ");
-    Serial.println(value);
-
-    handleBleCommand(value);
-
-    String response = "Got: " + value;
-    pCharacteristic->setValue(response.c_str());
-    pCharacteristic->notify();
   }
 };
+
+bool connectToBleServer() {
+  if (myDevice == nullptr) {
+    Serial.println("No BLE device to connect to");
+    return false;
+  }
+
+  Serial.println("Creating BLE client...");
+  pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallback());
+
+  Serial.println("Connecting to BLE server...");
+  if (!pClient->connect(myDevice)) {
+    Serial.println("BLE connection failed");
+    return false;
+  }
+
+  Serial.println("BLE connected");
+
+  BLERemoteService* pRemoteService = nullptr;
+  try {
+    pRemoteService = pClient->getService(BLEUUID(BLE_SERVICE_UUID));
+  } catch (...) {
+    pRemoteService = nullptr;
+  }
+
+  if (pRemoteService == nullptr) {
+    Serial.println("Could not find BLE service");
+    pClient->disconnect();
+    return false;
+  }
+
+  Serial.println("Found BLE service");
+
+  try {
+    pRemoteCharacteristic = pRemoteService->getCharacteristic(BLEUUID(BLE_CHARACTERISTIC_UUID));
+  } catch (...) {
+    pRemoteCharacteristic = nullptr;
+  }
+
+  if (pRemoteCharacteristic == nullptr) {
+    Serial.println("Could not find BLE characteristic");
+    pClient->disconnect();
+    return false;
+  }
+
+  Serial.println("Found BLE characteristic");
+
+  if (pRemoteCharacteristic->canRead()) {
+    String value = pRemoteCharacteristic->readValue();
+    Serial.print("Initial characteristic value: ");
+    Serial.println(value);
+  }
+
+  if (pRemoteCharacteristic->canNotify()) {
+    pRemoteCharacteristic->registerForNotify(notifyCallback);
+    Serial.println("Subscribed to BLE notifications");
+  } else {
+    Serial.println("Characteristic does not support notifications");
+    pClient->disconnect();
+    return false;
+  }
+
+  connected = true;
+  return true;
+}
+
+void startBleScan() {
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setInterval(1349);
+  pBLEScan->setWindow(449);
+  pBLEScan->setActiveScan(true);
+
+  Serial.println("Starting BLE scan...");
+  pBLEScan->start(0, false);
+}
 
 // =========================
 // WiFi helper
@@ -264,7 +373,7 @@ void connectIllinoisNet() {
 // Robot helpers
 // =========================
 bool commandMovesForward(char cmd) {
-  return (cmd == 'w' || cmd == 'W');
+  return (cmd == 'f' || cmd == 'F');
 }
 
 void stopRobot() {
@@ -279,31 +388,32 @@ void applyCommand(char cmd) {
   }
 
   switch (cmd) {
-    case 'w':
-    case 'W':
+    case 'f':
+    case 'F':
       forward(motor1, motor2, DRIVE_SPEED);
       Serial.println("Forward");
       break;
 
-    case 's':
-    case 'S':
+    case 'b':
+    case 'B':
       back(motor1, motor2, DRIVE_SPEED);
       Serial.println("Backward");
       break;
 
-    case 'a':
-    case 'A':
+    case 'l':
+    case 'L':
       left(motor1, motor2, DRIVE_SPEED);
       Serial.println("Left");
       break;
 
-    case 'd':
-    case 'D':
+    case 'r':
+    case 'R':
       right(motor1, motor2, DRIVE_SPEED);
       Serial.println("Right");
       break;
 
-    case ' ':
+    case 'x':
+    case 'X':
       stopRobot();
       Serial.println("Stop");
       break;
@@ -314,17 +424,17 @@ void applyCommand(char cmd) {
   }
 }
 
-void handleBleCommand(String value) {
+void handleBleValue(String value) {
   value.trim();
 
   if (value.length() == 0) {
-    currentCommand = ' ';
+    currentCommand = 'x';
     applyCommand(currentCommand);
     return;
   }
 
   if (value.equalsIgnoreCase("stop")) {
-    currentCommand = ' ';
+    currentCommand = 'x';
     applyCommand(currentCommand);
     return;
   }
@@ -332,11 +442,11 @@ void handleBleCommand(String value) {
   if (value.length() == 1) {
     char cmd = value.charAt(0);
 
-    if (cmd == 'w' || cmd == 'W' ||
-        cmd == 'a' || cmd == 'A' ||
-        cmd == 's' || cmd == 'S' ||
-        cmd == 'd' || cmd == 'D' ||
-        cmd == ' ') {
+    if (cmd == 'f' || cmd == 'F' ||
+        cmd == 'l' || cmd == 'L' ||
+        cmd == 'b' || cmd == 'B' ||
+        cmd == 'r' || cmd == 'R' ||
+        cmd == 'x' || cmd == 'X') {
       currentCommand = cmd;
       applyCommand(currentCommand);
       return;
@@ -400,47 +510,22 @@ void setup() {
 
   Serial.println("Robot + LiDAR + BLE control ready.");
   Serial.println("BLE commands:");
-  Serial.println("  w = forward");
-  Serial.println("  s = backward");
-  Serial.println("  a = left");
-  Serial.println("  d = right");
+  Serial.println("  f = forward");
+  Serial.println("  b = backward");
+  Serial.println("  l = left");
+  Serial.println("  r = right");
   Serial.println("  stop = stop");
   Serial.println();
+
   Serial.print("Automatic brake threshold: ");
   Serial.print(BRAKE_DISTANCE_MM);
   Serial.println(" mm");
   Serial.println();
 
-  // BLE setup
-  Serial.println("Starting BLE...");
-  BLEDevice::init(DEVICE_NAME);
-
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  BLEService* pService = pServer->createService(SERVICE_UUID);
-
-  pCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_UUID,
-    BLECharacteristic::PROPERTY_READ |
-    BLECharacteristic::PROPERTY_WRITE |
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-
-  pCharacteristic->addDescriptor(new BLE2902());
-  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
-  pCharacteristic->setValue("ESP32-S3 ready");
-
-  pService->start();
-
-  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  BLEDevice::startAdvertising();
-
-  Serial.println("BLE advertising started");
-  Serial.print("BLE device name: ");
-  Serial.println(DEVICE_NAME);
+  // BLE client setup
+  Serial.println("Starting BLE client...");
+  BLEDevice::init("");
+  startBleScan();
 
   // Camera setup
   Serial.println("cam setup");
@@ -555,15 +640,28 @@ void setup() {
 // Loop
 // =========================
 void loop() {
-  if (deviceConnected && !oldDeviceConnected) {
-    oldDeviceConnected = true;
+  if (doConnect) {
+    doConnect = false;
+
+    if (connectToBleServer()) {
+      Serial.println("Ready to receive BLE motion commands");
+    } else {
+      Serial.println("BLE connect failed, rescanning...");
+      doScan = true;
+    }
   }
 
-  if (!deviceConnected && oldDeviceConnected) {
-    delay(200);
-    pServer->startAdvertising();
-    Serial.println("Restarted advertising");
-    oldDeviceConnected = false;
+  if (!connected && doScan) {
+    doScan = false;
+    startBleScan();
+  }
+
+  if (connected && pClient != nullptr && !pClient->isConnected()) {
+    connected = false;
+    Serial.println("Lost BLE connection, rescanning...");
+    stopRobot();
+    currentCommand = 'x';
+    doScan = true;
   }
 
   unsigned long now = millis();
