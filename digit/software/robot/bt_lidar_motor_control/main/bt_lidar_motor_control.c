@@ -1214,11 +1214,22 @@ static void motor_control_task(void *arg) {
       bool rear_clear = !valid[2] || mm[2] >= OBSTACLE_CLEAR_MM;
       obstacle_close = rear_close;
       obstacle_clear = rear_clear;
+    } else if (desired == MOTION_LEFT) {
+      bool left_close = valid[0] && mm[0] <= OBSTACLE_STOP_MM;
+      bool left_clear = !valid[0] || mm[0] >= OBSTACLE_CLEAR_MM;
+      obstacle_close = left_close;
+      obstacle_clear = left_clear;
+    } else if (desired == MOTION_RIGHT) {
+      bool right_close = valid[1] && mm[1] <= OBSTACLE_STOP_MM;
+      bool right_clear = !valid[1] || mm[1] >= OBSTACLE_CLEAR_MM;
+      obstacle_close = right_close;
+      obstacle_clear = right_clear;
     } else {
       obstacle_clear = true;
     }
 
-    if (desired == MOTION_FORWARD || desired == MOTION_BACKWARD) {
+    if (desired == MOTION_FORWARD || desired == MOTION_BACKWARD ||
+        desired == MOTION_LEFT || desired == MOTION_RIGHT) {
       if (obstacle_close) {
         if (block_samples < UINT8_MAX) {
           ++block_samples;

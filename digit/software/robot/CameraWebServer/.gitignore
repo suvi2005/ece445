@@ -1,0 +1,26 @@
+# ESP-IDF build outputs
+build/
+.cache/
+
+# ESP-IDF generated local config
+sdkconfig
+sdkconfig.old
+!sdkconfig.defaults
+
+# ESP-IDF managed components (downloaded during build)
+managed_components/
+
+# Python/IDF tool caches
+__pycache__/
+*.pyc
+
+# Local editor settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.tmp
