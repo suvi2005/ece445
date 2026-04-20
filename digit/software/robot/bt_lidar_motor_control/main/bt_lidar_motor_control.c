@@ -65,7 +65,14 @@
 
 #define RANGE_READ_TIMEOUT_MS 100
 
+#define TOF_MIN_VALID_MM 40
+#define TOF_MAX_VALID_MM 2000
+#define TOF_OUT_OF_RANGE_MM 8190
+
 #define OBSTACLE_STOP_MM 250
+#define OBSTACLE_CLEAR_MM 300
+#define OBSTACLE_BLOCK_CONFIRM_SAMPLES 2
+#define OBSTACLE_CLEAR_CONFIRM_SAMPLES 2
 #define MOTOR_SPEED_DUTY 200
 
 #define CMD_TEXT_MAX_LEN 32
@@ -1056,7 +1063,17 @@ static esp_err_t vl53l0x_read_range_mm(i2c_master_dev_handle_t dev_handle,
 
   *range_mm = ((uint16_t)raw_range[0] << 8) | raw_range[1];
 
-  return i2c_write_reg(dev_handle, REG_SYSTEM_INTERRUPT_CLEAR, 0x01);
+  RETURN_ON_ERROR(i2c_write_reg(dev_handle, REG_SYSTEM_INTERRUPT_CLEAR, 0x01),
+                  TAG, "failed to clear range interrupt");
+
+  if (*range_mm < TOF_MIN_VALID_MM || *range_mm >= TOF_OUT_OF_RANGE_MM ||
+      *range_mm > TOF_MAX_VALID_MM) {
+    ESP_LOGW(TAG, "Ignoring invalid range %u mm from sensor 0x%02X", *range_mm,
+             address);
+    return ESP_ERR_INVALID_RESPONSE;
+  }
+
+  return ESP_OK;
 }
 
 static esp_err_t bring_up_tof_on_bus_2(gpio_num_t xshut_pin,
@@ -1160,25 +1177,66 @@ static void lidar_sampling_task(void *arg) {
 static void motor_control_task(void *arg) {
   (void)arg;
   motion_cmd_t last_applied = MOTION_STOP;
+  motion_cmd_t last_desired = MOTION_STOP;
   bool was_blocked = false;
+  uint8_t block_samples = 0;
+  uint8_t clear_samples = 0;
 
   while (true) {
     uint16_t mm[3] = {0};
     bool valid[3] = {false, false, false};
     motion_cmd_t desired = get_motion_command();
-    bool blocked = false;
+    bool obstacle_close = false;
+    bool obstacle_clear = true;
+    bool blocked = was_blocked;
 
     get_lidar_snapshot(mm, valid);
+
+    if (desired != last_desired) {
+      block_samples = 0;
+      clear_samples = 0;
+      was_blocked = false;
+      blocked = false;
+      last_desired = desired;
+    }
 
     if (s_motion_inhibit) {
       desired = MOTION_STOP;
     } else if (desired == MOTION_FORWARD) {
       bool front_1_close = valid[0] && mm[0] <= OBSTACLE_STOP_MM;
       bool front_2_close = valid[1] && mm[1] <= OBSTACLE_STOP_MM;
-      blocked = front_1_close || front_2_close;
+      bool front_1_clear = !valid[0] || mm[0] >= OBSTACLE_CLEAR_MM;
+      bool front_2_clear = !valid[1] || mm[1] >= OBSTACLE_CLEAR_MM;
+      obstacle_close = front_1_close || front_2_close;
+      obstacle_clear = front_1_clear && front_2_clear;
     } else if (desired == MOTION_BACKWARD) {
       bool rear_close = valid[2] && mm[2] <= OBSTACLE_STOP_MM;
-      blocked = rear_close;
+      bool rear_clear = !valid[2] || mm[2] >= OBSTACLE_CLEAR_MM;
+      obstacle_close = rear_close;
+      obstacle_clear = rear_clear;
+    } else {
+      obstacle_clear = true;
+    }
+
+    if (desired == MOTION_FORWARD || desired == MOTION_BACKWARD) {
+      if (obstacle_close) {
+        if (block_samples < UINT8_MAX) {
+          ++block_samples;
+        }
+        clear_samples = 0;
+      } else if (obstacle_clear) {
+        if (clear_samples < UINT8_MAX) {
+          ++clear_samples;
+        }
+        block_samples = 0;
+      }
+
+      if (!was_blocked && block_samples >= OBSTACLE_BLOCK_CONFIRM_SAMPLES) {
+        blocked = true;
+      } else if (was_blocked &&
+                 clear_samples >= OBSTACLE_CLEAR_CONFIRM_SAMPLES) {
+        blocked = false;
+      }
     }
 
     motion_cmd_t applied = blocked ? MOTION_STOP : desired;
