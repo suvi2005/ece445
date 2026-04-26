@@ -45,6 +45,17 @@
 #define PWMA 47
 #define PWMB 48
 
+#define LED_UART_TX_GPIO GPIO_NUM_43
+#define LED_UART_RX_GPIO GPIO_NUM_44
+#define HEAD_LED_LEDC_TIMER LEDC_TIMER_2
+#define HEAD_LED_LEDC_CHANNEL_LEFT LEDC_CHANNEL_4
+#define HEAD_LED_LEDC_CHANNEL_RIGHT LEDC_CHANNEL_5
+#define HEAD_LED_PWM_FREQ_HZ 1000
+#define HEAD_LED_PWM_MAX_DUTY 255
+#define HEAD_LED_WAKE_STEP 3
+#define HEAD_LED_SLEEP_STEP 5
+#define HEAD_LED_FADE_INTERVAL_MS 20
+
 #define I2C_BUS_1 I2C_NUM_0
 #define I2C_BUS_2 I2C_NUM_1
 #define I2C_FREQ_HZ 400000
@@ -68,12 +79,24 @@
 #define TOF_MIN_VALID_MM 40
 #define TOF_MAX_VALID_MM 2000
 #define TOF_OUT_OF_RANGE_MM 8190
+#define LOG_INVALID_TOF_RANGES 0
 
 #define OBSTACLE_STOP_MM 250
 #define OBSTACLE_CLEAR_MM 300
 #define OBSTACLE_BLOCK_CONFIRM_SAMPLES 2
 #define OBSTACLE_CLEAR_CONFIRM_SAMPLES 2
-#define MOTOR_SPEED_DUTY 200
+#define GLOVE_SPEED_MIN 1
+#define GLOVE_SPEED_MAX 20
+#define GLOVE_SPEED_SLOW_MAX 5
+#define GLOVE_SPEED_MEDIUM_MAX 10
+#define GLOVE_SPEED_FAST_MAX 15
+#define MOTOR_DUTY_SLOW 100
+#define MOTOR_DUTY_MEDIUM 165
+#define MOTOR_DUTY_FAST 215
+#define MOTOR_DUTY_MAX 255
+#define MOTOR_LEDC_TIMER LEDC_TIMER_1
+#define MOTOR_LEDC_CHANNEL_A LEDC_CHANNEL_2
+#define MOTOR_LEDC_CHANNEL_B LEDC_CHANNEL_3
 
 #define CMD_TEXT_MAX_LEN 32
 #define INVALID_HANDLE 0
@@ -89,6 +112,8 @@
 
 static const char *TAG = "BT_ROBOT_CTRL";
 void ble_store_config_init(void);
+esp_err_t robot_camera_start_on_boot(void);
+esp_err_t robot_camera_toggle_recording(void);
 
 typedef enum {
   MOTION_STOP = 0,
@@ -98,9 +123,22 @@ typedef enum {
   MOTION_RIGHT,
 } motion_cmd_t;
 
-static void set_motion_command(motion_cmd_t cmd);
+typedef enum {
+  ROBOT_COMMAND_MOTION = 0,
+  ROBOT_COMMAND_LED,
+  ROBOT_COMMAND_RECORD,
+} robot_command_type_t;
+
+typedef struct {
+  robot_command_type_t type;
+  motion_cmd_t motion;
+  uint32_t duty;
+} robot_command_t;
+
+static void set_motion_command(motion_cmd_t cmd, uint32_t duty);
 static void set_motion_inhibit(bool inhibit);
 static void motor_stop(void);
+static void head_led_set_brightness(uint32_t duty);
 
 typedef struct {
   const char *name;
@@ -113,10 +151,12 @@ static i2c_master_bus_handle_t s_bus_2 = NULL;
 
 static SemaphoreHandle_t s_state_mutex = NULL;
 static motion_cmd_t s_motion_cmd = MOTION_STOP;
+static uint32_t s_motion_duty = 0;
 static uint16_t s_lidar_mm[3] = {0};
 static bool s_lidar_valid[3] = {false, false, false};
 static volatile bool s_motion_inhibit = true;
 static TaskHandle_t s_motor_task_handle = NULL;
+static volatile bool s_head_led_enabled = false;
 
 typedef struct {
   char text[CMD_TEXT_MAX_LEN];
@@ -210,7 +250,7 @@ static void ble_handle_connection_lost(void) {
   s_ble_command_link_ready = false;
   ble_clear_pending_commands();
   set_motion_inhibit(true);
-  set_motion_command(MOTION_STOP);
+  set_motion_command(MOTION_STOP, 0);
   motor_stop();
   if (s_motor_task_handle != NULL) {
     xTaskNotifyGive(s_motor_task_handle);
@@ -510,7 +550,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
         ESP_LOGE(TAG, "BLE infer address type failed: %d", rc);
         s_ble_command_link_ready = false;
         ble_clear_pending_commands();
-        set_motion_command(MOTION_STOP);
+        set_motion_command(MOTION_STOP, 0);
         motor_stop();
         s_ble_client.connecting = false;
         ble_scan_start();
@@ -524,7 +564,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
                  event->disc.addr.type, ble_addr_to_str(&event->disc.addr), rc);
         s_ble_command_link_ready = false;
         ble_clear_pending_commands();
-        set_motion_command(MOTION_STOP);
+        set_motion_command(MOTION_STOP, 0);
         motor_stop();
         s_ble_client.connecting = false;
         ble_scan_start();
@@ -538,7 +578,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg) {
       ESP_LOGE(TAG, "BLE connection failed: %d", event->connect.status);
       s_ble_command_link_ready = false;
       ble_clear_pending_commands();
-      set_motion_command(MOTION_STOP);
+      set_motion_command(MOTION_STOP, 0);
       motor_stop();
       ble_reset_client_state();
       ble_scan_start();
@@ -668,30 +708,38 @@ static void set_motion_inhibit(bool inhibit) {
   s_motion_inhibit = inhibit;
 }
 
-static void set_motion_command(motion_cmd_t cmd) {
+static void set_motion_command(motion_cmd_t cmd, uint32_t duty) {
   if (s_state_mutex == NULL) {
     return;
   }
 
   if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
     s_motion_cmd = cmd;
+    s_motion_duty = (cmd == MOTION_STOP) ? 0 : duty;
     xSemaphoreGive(s_state_mutex);
   }
 }
 
-static motion_cmd_t get_motion_command(void) {
-  motion_cmd_t cmd = MOTION_STOP;
-
+static void get_motion_state(motion_cmd_t *cmd, uint32_t *duty) {
   if (s_state_mutex == NULL) {
-    return cmd;
+    if (cmd != NULL) {
+      *cmd = MOTION_STOP;
+    }
+    if (duty != NULL) {
+      *duty = 0;
+    }
+    return;
   }
 
   if (xSemaphoreTake(s_state_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-    cmd = s_motion_cmd;
+    if (cmd != NULL) {
+      *cmd = s_motion_cmd;
+    }
+    if (duty != NULL) {
+      *duty = s_motion_duty;
+    }
     xSemaphoreGive(s_state_mutex);
   }
-
-  return cmd;
 }
 
 static void update_lidar_reading(size_t index, uint16_t mm, bool valid) {
@@ -793,6 +841,94 @@ static bool __attribute__((unused)) parse_motion_command(const char *input,
   return false;
 }
 
+static int clamp_int(int value, int min_value, int max_value) {
+  if (value < min_value) {
+    return min_value;
+  }
+  if (value > max_value) {
+    return max_value;
+  }
+  return value;
+}
+
+static uint32_t glove_speed_to_duty(int speed) {
+  const int clamped = clamp_int(speed, GLOVE_SPEED_MIN, GLOVE_SPEED_MAX);
+
+  if (clamped <= GLOVE_SPEED_SLOW_MAX) {
+    return MOTOR_DUTY_SLOW;
+  }
+  if (clamped <= GLOVE_SPEED_MEDIUM_MAX) {
+    return MOTOR_DUTY_MEDIUM;
+  }
+  if (clamped <= GLOVE_SPEED_FAST_MAX) {
+    return MOTOR_DUTY_FAST;
+  }
+  return MOTOR_DUTY_MAX;
+}
+
+static bool parse_robot_command(const char *input, robot_command_t *command) {
+  if (input == NULL || command == NULL) {
+    return false;
+  }
+
+  char cleaned[CMD_TEXT_MAX_LEN] = {0};
+  size_t out = 0;
+  size_t len = strnlen(input, CMD_TEXT_MAX_LEN - 1);
+
+  while (out < len && isspace((unsigned char)input[out])) {
+    out++;
+  }
+
+  size_t start = out;
+  while (len > start && isspace((unsigned char)input[len - 1])) {
+    len--;
+  }
+
+  size_t cleaned_len = 0;
+  for (size_t i = start; i < len && cleaned_len < sizeof(cleaned) - 1; ++i) {
+    cleaned[cleaned_len++] = (char)tolower((unsigned char)input[i]);
+  }
+  cleaned[cleaned_len] = '\0';
+
+  if (strcmp(cleaned, "led") == 0) {
+    command->type = ROBOT_COMMAND_LED;
+    command->motion = MOTION_STOP;
+    command->duty = 0;
+    return true;
+  }
+
+  if (strcmp(cleaned, "record") == 0) {
+    command->type = ROBOT_COMMAND_RECORD;
+    command->motion = MOTION_STOP;
+    command->duty = 0;
+    return true;
+  }
+
+  char *speed_text = strchr(cleaned, ':');
+  int speed = GLOVE_SPEED_MAX;
+  if (speed_text != NULL) {
+    *speed_text = '\0';
+    speed_text++;
+
+    char *end = NULL;
+    long parsed_speed = strtol(speed_text, &end, 10);
+    if (end == speed_text || *end != '\0') {
+      return false;
+    }
+    speed = (int)parsed_speed;
+  }
+
+  motion_cmd_t motion = MOTION_STOP;
+  if (!parse_motion_command(cleaned, &motion)) {
+    return false;
+  }
+
+  command->type = ROBOT_COMMAND_MOTION;
+  command->motion = motion;
+  command->duty = (motion == MOTION_STOP) ? 0 : glove_speed_to_duty(speed);
+  return true;
+}
+
 static esp_err_t motor_driver_init(void) {
   const gpio_config_t dir_cfg = {
       .pin_bit_mask =
@@ -809,7 +945,7 @@ static esp_err_t motor_driver_init(void) {
   const ledc_timer_config_t timer_cfg = {
       .speed_mode = LEDC_LOW_SPEED_MODE,
       .duty_resolution = LEDC_TIMER_8_BIT,
-      .timer_num = LEDC_TIMER_0,
+      .timer_num = MOTOR_LEDC_TIMER,
       .freq_hz = 20000,
       .clk_cfg = LEDC_AUTO_CLK,
       .deconfigure = false,
@@ -819,9 +955,9 @@ static esp_err_t motor_driver_init(void) {
   const ledc_channel_config_t ch_a = {
       .gpio_num = PWMA,
       .speed_mode = LEDC_LOW_SPEED_MODE,
-      .channel = LEDC_CHANNEL_0,
+      .channel = MOTOR_LEDC_CHANNEL_A,
       .intr_type = LEDC_INTR_DISABLE,
-      .timer_sel = LEDC_TIMER_0,
+      .timer_sel = MOTOR_LEDC_TIMER,
       .duty = 0,
       .hpoint = 0,
       .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
@@ -831,9 +967,9 @@ static esp_err_t motor_driver_init(void) {
   const ledc_channel_config_t ch_b = {
       .gpio_num = PWMB,
       .speed_mode = LEDC_LOW_SPEED_MODE,
-      .channel = LEDC_CHANNEL_1,
+      .channel = MOTOR_LEDC_CHANNEL_B,
       .intr_type = LEDC_INTR_DISABLE,
-      .timer_sel = LEDC_TIMER_0,
+      .timer_sel = MOTOR_LEDC_TIMER,
       .duty = 0,
       .hpoint = 0,
       .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
@@ -856,10 +992,10 @@ static void motor_set_direction(bool left_forward, bool right_forward) {
 }
 
 static void motor_set_speed(uint32_t duty) {
-  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-  ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
-  ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, MOTOR_LEDC_CHANNEL_A, duty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, MOTOR_LEDC_CHANNEL_A);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, MOTOR_LEDC_CHANNEL_B, duty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, MOTOR_LEDC_CHANNEL_B);
 }
 
 static void motor_stop(void) {
@@ -870,29 +1006,127 @@ static void motor_stop(void) {
   motor_set_speed(0);
 }
 
-static void motor_apply_command(motion_cmd_t cmd) {
+static void motor_apply_command(motion_cmd_t cmd, uint32_t duty) {
   switch (cmd) {
   case MOTION_FORWARD:
     motor_set_direction(true, true);
-    motor_set_speed(MOTOR_SPEED_DUTY);
+    motor_set_speed(duty);
     break;
   case MOTION_BACKWARD:
     motor_set_direction(false, false);
-    motor_set_speed(MOTOR_SPEED_DUTY);
+    motor_set_speed(duty);
     break;
   case MOTION_LEFT:
     motor_set_direction(false, true);
-    motor_set_speed(MOTOR_SPEED_DUTY);
+    motor_set_speed(duty);
     break;
   case MOTION_RIGHT:
     motor_set_direction(true, false);
-    motor_set_speed(MOTOR_SPEED_DUTY);
+    motor_set_speed(duty);
     break;
   case MOTION_STOP:
   default:
     motor_stop();
     break;
   }
+}
+
+static esp_err_t head_led_init(void) {
+  const ledc_timer_config_t timer_cfg = {
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .duty_resolution = LEDC_TIMER_8_BIT,
+      .timer_num = HEAD_LED_LEDC_TIMER,
+      .freq_hz = HEAD_LED_PWM_FREQ_HZ,
+      .clk_cfg = LEDC_AUTO_CLK,
+      .deconfigure = false,
+  };
+
+  RETURN_ON_ERROR(ledc_timer_config(&timer_cfg), TAG,
+                  "head LED PWM timer init failed");
+
+  const ledc_channel_config_t left = {
+      .gpio_num = LED_UART_TX_GPIO,
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .channel = HEAD_LED_LEDC_CHANNEL_LEFT,
+      .intr_type = LEDC_INTR_DISABLE,
+      .timer_sel = HEAD_LED_LEDC_TIMER,
+      .duty = 0,
+      .hpoint = 0,
+      .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
+      .flags.output_invert = 1,
+  };
+
+  const ledc_channel_config_t right = {
+      .gpio_num = LED_UART_RX_GPIO,
+      .speed_mode = LEDC_LOW_SPEED_MODE,
+      .channel = HEAD_LED_LEDC_CHANNEL_RIGHT,
+      .intr_type = LEDC_INTR_DISABLE,
+      .timer_sel = HEAD_LED_LEDC_TIMER,
+      .duty = 0,
+      .hpoint = 0,
+      .sleep_mode = LEDC_SLEEP_MODE_NO_ALIVE_NO_PD,
+      .flags.output_invert = 1,
+  };
+
+  RETURN_ON_ERROR(ledc_channel_config(&left), TAG,
+                  "head LED left PWM init failed");
+  RETURN_ON_ERROR(ledc_channel_config(&right), TAG,
+                  "head LED right PWM init failed");
+  head_led_set_brightness(0);
+  return ESP_OK;
+}
+
+static void head_led_set_brightness(uint32_t duty) {
+  if (duty > HEAD_LED_PWM_MAX_DUTY) {
+    duty = HEAD_LED_PWM_MAX_DUTY;
+  }
+
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, HEAD_LED_LEDC_CHANNEL_LEFT, duty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, HEAD_LED_LEDC_CHANNEL_LEFT);
+  ledc_set_duty(LEDC_LOW_SPEED_MODE, HEAD_LED_LEDC_CHANNEL_RIGHT, duty);
+  ledc_update_duty(LEDC_LOW_SPEED_MODE, HEAD_LED_LEDC_CHANNEL_RIGHT);
+}
+
+static void head_led_toggle_enabled(void) {
+  s_head_led_enabled = !s_head_led_enabled;
+  ESP_LOGI(TAG, "Head LED wake %s", s_head_led_enabled ? "enabled" : "disabled");
+}
+
+static void head_led_task(void *arg) {
+  (void)arg;
+  uint32_t brightness = 0;
+
+  while (true) {
+    const uint32_t target =
+        s_head_led_enabled ? HEAD_LED_PWM_MAX_DUTY : 0;
+
+    if (brightness < target) {
+      const uint32_t next = brightness + HEAD_LED_WAKE_STEP;
+      brightness = (next > target) ? target : next;
+      head_led_set_brightness(brightness);
+    } else if (brightness > target) {
+      brightness = (brightness > HEAD_LED_SLEEP_STEP)
+                       ? brightness - HEAD_LED_SLEEP_STEP
+                       : 0;
+      head_led_set_brightness(brightness);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(HEAD_LED_FADE_INTERVAL_MS));
+  }
+}
+
+static esp_err_t storage_init(void) {
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+      err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    RETURN_ON_ERROR(nvs_flash_erase(), TAG, "nvs erase failed");
+    RETURN_ON_ERROR(nvs_flash_init(), TAG, "nvs init failed after erase");
+  } else if (err != ESP_OK) {
+    ESP_LOGE(TAG, "nvs init failed: %s", esp_err_to_name(err));
+    return err;
+  }
+
+  return ESP_OK;
 }
 
 static esp_err_t i2c_bus_init(i2c_port_num_t port, gpio_num_t sda,
@@ -1068,8 +1302,10 @@ static esp_err_t vl53l0x_read_range_mm(i2c_master_dev_handle_t dev_handle,
 
   if (*range_mm < TOF_MIN_VALID_MM || *range_mm >= TOF_OUT_OF_RANGE_MM ||
       *range_mm > TOF_MAX_VALID_MM) {
+#if LOG_INVALID_TOF_RANGES
     ESP_LOGW(TAG, "Ignoring invalid range %u mm from sensor 0x%02X", *range_mm,
              address);
+#endif
     return ESP_ERR_INVALID_RESPONSE;
   }
 
@@ -1178,6 +1414,8 @@ static void motor_control_task(void *arg) {
   (void)arg;
   motion_cmd_t last_applied = MOTION_STOP;
   motion_cmd_t last_desired = MOTION_STOP;
+  uint32_t last_applied_duty = 0;
+  uint32_t last_desired_duty = 0;
   bool was_blocked = false;
   uint8_t block_samples = 0;
   uint8_t clear_samples = 0;
@@ -1185,23 +1423,27 @@ static void motor_control_task(void *arg) {
   while (true) {
     uint16_t mm[3] = {0};
     bool valid[3] = {false, false, false};
-    motion_cmd_t desired = get_motion_command();
+    motion_cmd_t desired = MOTION_STOP;
+    uint32_t desired_duty = 0;
     bool obstacle_close = false;
     bool obstacle_clear = true;
     bool blocked = was_blocked;
 
+    get_motion_state(&desired, &desired_duty);
     get_lidar_snapshot(mm, valid);
 
-    if (desired != last_desired) {
+    if (desired != last_desired || desired_duty != last_desired_duty) {
       block_samples = 0;
       clear_samples = 0;
       was_blocked = false;
       blocked = false;
       last_desired = desired;
+      last_desired_duty = desired_duty;
     }
 
     if (s_motion_inhibit) {
       desired = MOTION_STOP;
+      desired_duty = 0;
     } else if (desired == MOTION_FORWARD) {
       bool front_1_close = valid[0] && mm[0] <= OBSTACLE_STOP_MM;
       bool front_2_close = valid[1] && mm[1] <= OBSTACLE_STOP_MM;
@@ -1251,10 +1493,13 @@ static void motor_control_task(void *arg) {
     }
 
     motion_cmd_t applied = blocked ? MOTION_STOP : desired;
-    if (applied != last_applied) {
-      motor_apply_command(applied);
+    uint32_t applied_duty = (applied == MOTION_STOP) ? 0 : desired_duty;
+    if (applied != last_applied || applied_duty != last_applied_duty) {
+      motor_apply_command(applied, applied_duty);
       last_applied = applied;
-      ESP_LOGI(TAG, "Motor state -> %s", motion_cmd_to_string(applied));
+      last_applied_duty = applied_duty;
+      ESP_LOGI(TAG, "Motor state -> %s duty=%lu", motion_cmd_to_string(applied),
+               (unsigned long)applied_duty);
     }
 
     if (blocked && !was_blocked) {
@@ -1276,7 +1521,7 @@ static void bluetooth_receiver_task(void *arg) {
     return;
   }
 
-  ESP_LOGI(TAG, "BLE receiver ready: write left/right/forward/backward/stop");
+  ESP_LOGI(TAG, "BLE receiver ready for glove commands: f:1..20, b:1..20, l:1..20, r:1..20, stop:0, LED, RECORD");
 
   while (true) {
     bt_rx_msg_t msg = {0};
@@ -1285,17 +1530,34 @@ static void bluetooth_receiver_task(void *arg) {
         continue;
       }
 
-      motion_cmd_t cmd = MOTION_STOP;
-      if (parse_motion_command(msg.text, &cmd)) {
+      robot_command_t command = {
+          .type = ROBOT_COMMAND_MOTION,
+          .motion = MOTION_STOP,
+          .duty = 0,
+      };
+
+      if (parse_robot_command(msg.text, &command)) {
         if (!s_ble_command_link_ready) {
           continue;
         }
-        set_motion_inhibit(false);
-        set_motion_command(cmd);
-        if (s_motor_task_handle != NULL) {
-          xTaskNotifyGive(s_motor_task_handle);
+
+        if (command.type == ROBOT_COMMAND_LED) {
+          head_led_toggle_enabled();
+        } else if (command.type == ROBOT_COMMAND_RECORD) {
+          esp_err_t err = robot_camera_toggle_recording();
+          if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Camera toggle failed: %s", esp_err_to_name(err));
+          }
+        } else {
+          set_motion_inhibit(false);
+          set_motion_command(command.motion, command.duty);
+          if (s_motor_task_handle != NULL) {
+            xTaskNotifyGive(s_motor_task_handle);
+          }
+          ESP_LOGI(TAG, "Bluetooth command -> %s duty=%lu",
+                   motion_cmd_to_string(command.motion),
+                   (unsigned long)command.duty);
         }
-        ESP_LOGI(TAG, "Bluetooth command -> %s", motion_cmd_to_string(cmd));
       } else {
         ESP_LOGW(TAG, "Ignoring unknown command: '%s'", msg.text);
       }
@@ -1318,6 +1580,16 @@ void app_main(void) {
     return;
   }
 
+  if (storage_init() != ESP_OK) {
+    ESP_LOGE(TAG, "Storage initialization failed");
+    return;
+  }
+
+  if (robot_camera_start_on_boot() != ESP_OK) {
+    ESP_LOGE(TAG, "Camera startup failed");
+    return;
+  }
+
   if (init_all_sensors(sensors, sizeof(sensors) / sizeof(sensors[0])) !=
       ESP_OK) {
     ESP_LOGE(TAG, "Sensor initialization failed. Check wiring, pullups, XSHUT "
@@ -1330,10 +1602,16 @@ void app_main(void) {
     return;
   }
 
+  if (head_led_init() != ESP_OK) {
+    ESP_LOGE(TAG, "Head LED initialization failed");
+    return;
+  }
+
   motor_stop();
 
   xTaskCreatePinnedToCore(motor_control_task, "motor_ctrl", 4096, NULL, 10,
                           &s_motor_task_handle, 0);
+  xTaskCreate(head_led_task, "head_led", 2048, NULL, 6, NULL);
   xTaskCreate(lidar_sampling_task, "lidar_task", 6144, sensors, 9, NULL);
   xTaskCreatePinnedToCore(bluetooth_receiver_task, "bt_rx_task", 8192, NULL, 8,
                           NULL, 1);
