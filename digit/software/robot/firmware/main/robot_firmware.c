@@ -85,12 +85,12 @@
 #define OBSTACLE_CLEAR_MM 300
 #define OBSTACLE_BLOCK_CONFIRM_SAMPLES 2
 #define OBSTACLE_CLEAR_CONFIRM_SAMPLES 2
-#define GLOVE_SPEED_MIN 10
+#define GLOVE_SPEED_MIN 15
 #define GLOVE_SPEED_MAX 20
-#define GLOVE_SPEED_SLOW_MAX 12
-#define GLOVE_SPEED_MEDIUM_MAX 15
-#define GLOVE_SPEED_FAST_MAX 18
-#define MOTOR_DUTY_SLOW 100
+#define GLOVE_SPEED_SLOW_MAX 16
+#define GLOVE_SPEED_MEDIUM_MAX 18
+#define GLOVE_SPEED_FAST_MAX 19
+#define MOTOR_DUTY_SLOW 80
 #define MOTOR_DUTY_MEDIUM 165
 #define MOTOR_DUTY_FAST 215
 #define MOTOR_DUTY_MAX 255
@@ -196,6 +196,7 @@ static void ble_scan_start(void);
 static const char *ble_addr_to_str(const ble_addr_t *addr);
 static void ble_clear_pending_commands(void);
 static void ble_queue_received_bytes(const uint8_t *data, size_t length);
+static void ble_send_stop_for_obstacle(void);
 static void ble_handle_connection_lost(void);
 static void ble_reset_client_state(void);
 static void ble_start_service_discovery(uint16_t conn_handle);
@@ -213,6 +214,9 @@ static int ble_dsc_disc_cb(uint16_t conn_handle,
 static int ble_subscribe_write_cb(uint16_t conn_handle,
                                   const struct ble_gatt_error *error,
                                   struct ble_gatt_attr *attr, void *arg);
+static int ble_stop_write_cb(uint16_t conn_handle,
+                             const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr, void *arg);
 static int ble_mtu_event_cb(uint16_t conn_handle,
                             const struct ble_gatt_error *error,
                             uint16_t mtu, void *arg);
@@ -243,6 +247,40 @@ static void ble_clear_pending_commands(void) {
 
   bt_rx_msg_t discarded = {0};
   while (xQueueReceive(s_bt_rx_queue, &discarded, 0) == pdTRUE) {
+  }
+}
+
+static int ble_stop_write_cb(uint16_t conn_handle,
+                             const struct ble_gatt_error *error,
+                             struct ble_gatt_attr *attr, void *arg) {
+  (void)conn_handle;
+  (void)attr;
+  (void)arg;
+
+  if (error->status != 0) {
+    ESP_LOGW(TAG, "Obstacle stop BLE write failed: %d", error->status);
+  } else {
+    ESP_LOGI(TAG, "Obstacle stop sent over BLE");
+  }
+  return 0;
+}
+
+static void ble_send_stop_for_obstacle(void) {
+  static const char stop_command[] = "stop:0";
+
+  if (!s_ble_command_link_ready ||
+      s_ble_client.conn_handle == BLE_HS_CONN_HANDLE_NONE ||
+      s_ble_client.char_val_handle == 0) {
+    ESP_LOGW(TAG, "Obstacle stop not sent; BLE command link is not ready");
+    return;
+  }
+
+  int rc = ble_gattc_write_flat(s_ble_client.conn_handle,
+                                s_ble_client.char_val_handle, stop_command,
+                                sizeof(stop_command) - 1, ble_stop_write_cb,
+                                NULL);
+  if (rc != 0) {
+    ESP_LOGW(TAG, "Obstacle stop BLE write start failed: %d", rc);
   }
 }
 
@@ -1506,6 +1544,7 @@ static void motor_control_task(void *arg) {
       ESP_LOGW(TAG, "Safety stop: cmd=%s, S1=%u(%d) S2=%u(%d) S3=%u(%d)",
                motion_cmd_to_string(desired), mm[0], valid[0], mm[1], valid[1],
                mm[2], valid[2]);
+      ble_send_stop_for_obstacle();
     }
     was_blocked = blocked;
 

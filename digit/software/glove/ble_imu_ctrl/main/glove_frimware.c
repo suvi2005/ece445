@@ -4,12 +4,14 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_adc/adc_oneshot.h"
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
@@ -32,6 +34,15 @@
 #define IMU_ADDR_LOW 0x6A
 #define IMU_ADDR_HIGH 0x6B
 
+#define I2C_MUX_ADDR 0x70
+#define DRV2605_ADDR 0x5A
+
+#define HAPTIC_CHANNEL_A 0
+#define HAPTIC_CHANNEL_B 1
+#define HAPTIC_EN_GPIO_A GPIO_NUM_38
+#define HAPTIC_EN_GPIO_B GPIO_NUM_37
+#define HAPTIC_STOP_EFFECT 47
+
 #define BLE_DEVICE_NAME "ESP32S3_GLOVE"
 
 #define COMMAND_UPDATE_MS 100
@@ -45,7 +56,7 @@
 #define FLEX_SENSOR_ADC_BITWIDTH  ADC_BITWIDTH_12
 
 #define FLEX_SENSOR_COUNT 3
-#define SPEED_MIN 1
+#define SPEED_MIN 10
 #define SPEED_MAX 20
 
 /*
@@ -53,8 +64,8 @@
  * straight = raw ADC when finger is straight
  * bent     = raw ADC when finger is bent
  */
-static const int FLEX_RAW_STRAIGHT[FLEX_SENSOR_COUNT] = {1800, 1400, 1400};
-static const int FLEX_RAW_BENT[FLEX_SENSOR_COUNT]     = {2500, 2500, 2500};
+static const int FLEX_RAW_STRAIGHT[FLEX_SENSOR_COUNT] = {1600, 1800, 1400};
+static const int FLEX_RAW_BENT[FLEX_SENSOR_COUNT]     = {2800, 3000, 2500};
 
 /*
  * Movement threshold:
@@ -63,14 +74,14 @@ static const int FLEX_RAW_BENT[FLEX_SENSOR_COUNT]     = {2500, 2500, 2500};
  * With 1400-2500 calibration:
  * 0.60 means raw needs to be about 2060+ to count as bent.
  */
-#define FLEX_MOVE_BENT_THRESHOLD 0.60f
+#define FLEX_MOVE_BENT_THRESHOLD 0.30f
 
 /*
  * Gesture thresholds:
  * Used only for LED / RECORD gesture patterns.
  */
-#define FLEX_GESTURE_BENT_THRESHOLD     0.60f
-#define FLEX_GESTURE_STRAIGHT_THRESHOLD 0.25f
+#define FLEX_GESTURE_BENT_THRESHOLD     0.20f
+#define FLEX_GESTURE_STRAIGHT_THRESHOLD 0.10f
 
 /*
  * Real flick detection uses gyroscope angular velocity.
@@ -92,6 +103,19 @@ static const uint8_t REG_OUTX_L_G = 0x22;
 static const uint8_t REG_OUTX_L_A = 0x28;
 
 static const uint8_t WHO_AM_I_EXPECTED = 0x6C;
+
+static const uint8_t DRV2605_REG_STATUS = 0x00;
+static const uint8_t DRV2605_REG_MODE = 0x01;
+static const uint8_t DRV2605_REG_WAVESEQ1 = 0x04;
+static const uint8_t DRV2605_REG_GO = 0x0C;
+static const uint8_t DRV2605_REG_RATEDV = 0x16;
+static const uint8_t DRV2605_REG_CLAMPV = 0x17;
+static const uint8_t DRV2605_REG_FEEDBACK = 0x1A;
+static const uint8_t DRV2605_REG_LIBRARY = 0x03;
+
+static const uint8_t DRV2605_MODE_INTERNAL_TRIGGER = 0x00;
+static const uint8_t DRV2605_LIBRARY_ERM_A = 1;
+static const uint8_t DRV2605_WAVEFORM_END = 0x00;
 
 static const float ACCEL_MG_PER_LSB = 0.061f;
 static const float GYRO_MDPS_PER_LSB = 8.75f;
@@ -138,6 +162,10 @@ static flex_sensor_t flex_sensors[FLEX_SENSOR_COUNT] = {
 static uint8_t s_imu_addr = 0;
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static i2c_master_dev_handle_t s_imu_dev = NULL;
+static i2c_master_dev_handle_t s_i2c_mux_dev = NULL;
+static i2c_master_dev_handle_t s_haptic_dev = NULL;
+static SemaphoreHandle_t s_i2c_mutex = NULL;
+static bool s_haptic_ready = false;
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 
 static uint8_t s_own_addr_type;
@@ -168,7 +196,10 @@ static const struct ble_gatt_chr_def s_command_characteristics[] = {
     {
         .uuid = &s_char_uuid.u,
         .access_cb = gatt_access_cb,
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY,
+        .flags = BLE_GATT_CHR_F_READ |
+                 BLE_GATT_CHR_F_WRITE |
+                 BLE_GATT_CHR_F_WRITE_NO_RSP |
+                 BLE_GATT_CHR_F_NOTIFY,
         .val_handle = &s_command_val_handle,
     },
     {0},
@@ -207,7 +238,54 @@ static float clamp_float(float value, float min_value, float max_value) {
     return value;
 }
 
+static void i2c_lock(void) {
+    if (s_i2c_mutex != NULL) {
+        xSemaphoreTake(s_i2c_mutex, portMAX_DELAY);
+    }
+}
+
+static void i2c_unlock(void) {
+    if (s_i2c_mutex != NULL) {
+        xSemaphoreGive(s_i2c_mutex);
+    }
+}
+
+static esp_err_t i2c_transmit_locked(i2c_master_dev_handle_t dev,
+                                     const uint8_t *data,
+                                     size_t len) {
+    i2c_lock();
+    const esp_err_t ret = i2c_master_transmit(dev, data, len, I2C_TIMEOUT_MS);
+    i2c_unlock();
+
+    return ret;
+}
+
+static esp_err_t i2c_transmit_receive_locked(i2c_master_dev_handle_t dev,
+                                             const uint8_t *write_buffer,
+                                             size_t write_size,
+                                             uint8_t *read_buffer,
+                                             size_t read_size) {
+    i2c_lock();
+    const esp_err_t ret = i2c_master_transmit_receive(dev,
+                                                      write_buffer,
+                                                      write_size,
+                                                      read_buffer,
+                                                      read_size,
+                                                      I2C_TIMEOUT_MS);
+    i2c_unlock();
+
+    return ret;
+}
+
 static esp_err_t i2c_master_init(void) {
+    if (s_i2c_mutex == NULL) {
+        s_i2c_mutex = xSemaphoreCreateMutex();
+
+        if (s_i2c_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     const i2c_master_bus_config_t cfg = {
         .i2c_port = I2C_PORT,
         .sda_io_num = SDA_PIN,
@@ -242,19 +320,223 @@ static esp_err_t write_register(i2c_master_dev_handle_t dev,
                                 uint8_t reg,
                                 uint8_t value) {
     uint8_t payload[2] = {reg, value};
-    return i2c_master_transmit(dev, payload, sizeof(payload), I2C_TIMEOUT_MS);
+    return i2c_transmit_locked(dev, payload, sizeof(payload));
 }
 
 static esp_err_t read_registers(i2c_master_dev_handle_t dev,
                                 uint8_t start_reg,
                                 uint8_t *buffer,
                                 size_t len) {
-    return i2c_master_transmit_receive(dev,
-                                       &start_reg,
-                                       1,
-                                       buffer,
-                                       len,
-                                       I2C_TIMEOUT_MS);
+    return i2c_transmit_receive_locked(dev, &start_reg, 1, buffer, len);
+}
+
+static esp_err_t haptic_enable_pin(gpio_num_t pin) {
+    const gpio_config_t io_conf = {
+        .pin_bit_mask = 1ULL << pin,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    ESP_RETURN_ON_ERROR(gpio_config(&io_conf),
+                        TAG,
+                        "haptic enable gpio config failed");
+
+    gpio_set_level(pin, 1);
+    ESP_LOGI(TAG, "Haptic EN set HIGH on GPIO%d", pin);
+
+    return ESP_OK;
+}
+
+static esp_err_t haptic_enable_init(void) {
+    ESP_RETURN_ON_ERROR(haptic_enable_pin(HAPTIC_EN_GPIO_A),
+                        TAG,
+                        "haptic A enable failed");
+    ESP_RETURN_ON_ERROR(haptic_enable_pin(HAPTIC_EN_GPIO_B),
+                        TAG,
+                        "haptic B enable failed");
+
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    return ESP_OK;
+}
+
+static esp_err_t mux_write(uint8_t value) {
+    return i2c_transmit_locked(s_i2c_mux_dev, &value, sizeof(value));
+}
+
+static esp_err_t mux_select_channel(uint8_t channel) {
+    if (channel > 7) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(mux_write(1U << channel),
+                        TAG,
+                        "mux channel select failed");
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    return ESP_OK;
+}
+
+static esp_err_t mux_select_both_haptic_channels(void) {
+    const uint8_t value = (1U << HAPTIC_CHANNEL_A) | (1U << HAPTIC_CHANNEL_B);
+
+    ESP_RETURN_ON_ERROR(mux_write(value),
+                        TAG,
+                        "mux both-channel select failed");
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    return ESP_OK;
+}
+
+static esp_err_t mux_disable_all_channels(void) {
+    ESP_RETURN_ON_ERROR(mux_write(0x00), TAG, "mux disable failed");
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    return ESP_OK;
+}
+
+static esp_err_t drv2605_write_reg(uint8_t reg, uint8_t value) {
+    return write_register(s_haptic_dev, reg, value);
+}
+
+static esp_err_t drv2605_read_reg(uint8_t reg, uint8_t *value) {
+    return read_registers(s_haptic_dev, reg, value, 1);
+}
+
+static esp_err_t drv2605_stop(void) {
+    return drv2605_write_reg(DRV2605_REG_GO, 0x00);
+}
+
+static esp_err_t drv2605_start(void) {
+    return drv2605_write_reg(DRV2605_REG_GO, 0x01);
+}
+
+static esp_err_t drv2605_set_waveform(uint8_t slot, uint8_t waveform) {
+    if (slot > 7) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return drv2605_write_reg(DRV2605_REG_WAVESEQ1 + slot, waveform);
+}
+
+static esp_err_t drv2605_init_current_channel(uint8_t channel) {
+    uint8_t status = 0;
+    uint8_t feedback = 0;
+
+    ESP_RETURN_ON_ERROR(mux_select_channel(channel),
+                        TAG,
+                        "haptic mux select failed");
+
+    ESP_RETURN_ON_ERROR(i2c_master_probe(s_i2c_bus,
+                                         DRV2605_ADDR,
+                                         I2C_TIMEOUT_MS),
+                        TAG,
+                        "DRV2605 probe failed");
+
+    ESP_RETURN_ON_ERROR(drv2605_read_reg(DRV2605_REG_STATUS, &status),
+                        TAG,
+                        "DRV2605 status read failed");
+    ESP_LOGI(TAG,
+             "DRV2605L STATUS on mux channel %u = 0x%02X",
+             channel,
+             status);
+
+    ESP_RETURN_ON_ERROR(drv2605_write_reg(DRV2605_REG_MODE,
+                                          DRV2605_MODE_INTERNAL_TRIGGER),
+                        TAG,
+                        "DRV2605 mode init failed");
+
+    ESP_RETURN_ON_ERROR(drv2605_write_reg(DRV2605_REG_RATEDV, 0xFF),
+                        TAG,
+                        "DRV2605 rated voltage init failed");
+    ESP_RETURN_ON_ERROR(drv2605_write_reg(DRV2605_REG_CLAMPV, 0xFF),
+                        TAG,
+                        "DRV2605 clamp voltage init failed");
+
+    ESP_RETURN_ON_ERROR(drv2605_read_reg(DRV2605_REG_FEEDBACK, &feedback),
+                        TAG,
+                        "DRV2605 feedback read failed");
+    feedback &= ~0x80;
+    ESP_RETURN_ON_ERROR(drv2605_write_reg(DRV2605_REG_FEEDBACK, feedback),
+                        TAG,
+                        "DRV2605 ERM feedback init failed");
+
+    ESP_RETURN_ON_ERROR(drv2605_write_reg(DRV2605_REG_LIBRARY,
+                                          DRV2605_LIBRARY_ERM_A),
+                        TAG,
+                        "DRV2605 library init failed");
+
+    for (uint8_t i = 0; i < 8; ++i) {
+        ESP_RETURN_ON_ERROR(drv2605_set_waveform(i, DRV2605_WAVEFORM_END),
+                            TAG,
+                            "DRV2605 waveform clear failed");
+    }
+
+    ESP_LOGI(TAG, "DRV2605L init complete on mux channel %u", channel);
+
+    return ESP_OK;
+}
+
+static esp_err_t haptic_play_stop_effect(void) {
+    if (!s_haptic_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_RETURN_ON_ERROR(mux_select_both_haptic_channels(),
+                        TAG,
+                        "haptic mux select failed");
+    ESP_RETURN_ON_ERROR(drv2605_stop(), TAG, "haptic stop failed");
+    ESP_RETURN_ON_ERROR(drv2605_write_reg(DRV2605_REG_MODE,
+                                          DRV2605_MODE_INTERNAL_TRIGGER),
+                        TAG,
+                        "haptic trigger mode failed");
+    ESP_RETURN_ON_ERROR(drv2605_set_waveform(0, HAPTIC_STOP_EFFECT),
+                        TAG,
+                        "haptic waveform set failed");
+    ESP_RETURN_ON_ERROR(drv2605_set_waveform(1, DRV2605_WAVEFORM_END),
+                        TAG,
+                        "haptic waveform end set failed");
+    ESP_RETURN_ON_ERROR(drv2605_start(), TAG, "haptic start failed");
+
+    ESP_LOGI(TAG, "Played haptic stop effect %u", HAPTIC_STOP_EFFECT);
+
+    return ESP_OK;
+}
+
+static esp_err_t haptic_setup(void) {
+    ESP_RETURN_ON_ERROR(haptic_enable_init(), TAG, "haptic enable failed");
+
+    ESP_RETURN_ON_ERROR(i2c_add_device(I2C_MUX_ADDR, &s_i2c_mux_dev),
+                        TAG,
+                        "haptic mux add failed");
+    ESP_RETURN_ON_ERROR(i2c_add_device(DRV2605_ADDR, &s_haptic_dev),
+                        TAG,
+                        "haptic DRV2605 add failed");
+
+    ESP_RETURN_ON_ERROR(i2c_master_probe(s_i2c_bus, I2C_MUX_ADDR, I2C_TIMEOUT_MS),
+                        TAG,
+                        "haptic mux probe failed");
+
+    ESP_RETURN_ON_ERROR(mux_disable_all_channels(),
+                        TAG,
+                        "haptic mux disable failed");
+    ESP_RETURN_ON_ERROR(drv2605_init_current_channel(HAPTIC_CHANNEL_A),
+                        TAG,
+                        "haptic A init failed");
+    ESP_RETURN_ON_ERROR(drv2605_init_current_channel(HAPTIC_CHANNEL_B),
+                        TAG,
+                        "haptic B init failed");
+
+    ESP_RETURN_ON_ERROR(mux_disable_all_channels(),
+                        TAG,
+                        "haptic mux final disable failed");
+
+    s_haptic_ready = true;
+    ESP_LOGI(TAG, "Both haptic drivers initialized");
+
+    return ESP_OK;
 }
 
 static int16_t combine_int16(uint8_t low_byte, uint8_t high_byte) {
@@ -568,9 +850,13 @@ static int compute_speed_from_bend_percent(
 
     const float avg_percent = sum_percent / (float)FLEX_SENSOR_COUNT;
 
+    const float active_percent =
+        (avg_percent - FLEX_MOVE_BENT_THRESHOLD) /
+        (1.0f - FLEX_MOVE_BENT_THRESHOLD);
+
     const int speed =
         SPEED_MIN +
-        (int)lroundf(avg_percent * (float)(SPEED_MAX - SPEED_MIN));
+        (int)lroundf(active_percent * (float)(SPEED_MAX - SPEED_MIN));
 
     return clamp_int(speed, SPEED_MIN, SPEED_MAX);
 }
@@ -660,6 +946,51 @@ static void update_command_value(const char *payload) {
     }
 }
 
+static bool is_stop_feedback_message(char *message) {
+    size_t len = strlen(message);
+
+    while (len > 0 &&
+           (message[len - 1] == '\r' ||
+            message[len - 1] == '\n' ||
+            message[len - 1] == ' ' ||
+            message[len - 1] == '\t')) {
+        message[len - 1] = '\0';
+        --len;
+    }
+
+    return strcmp(message, "stop") == 0 || strcmp(message, "stop:0") == 0;
+}
+
+static int handle_command_write(struct ble_gatt_access_ctxt *ctxt) {
+    char incoming[16] = "";
+    const uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+
+    if (len >= sizeof(incoming)) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    const int rc = os_mbuf_copydata(ctxt->om, 0, len, incoming);
+
+    if (rc != 0) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    incoming[len] = '\0';
+    ESP_LOGI(TAG, "Received BLE write: %s", incoming);
+
+    if (is_stop_feedback_message(incoming)) {
+        const esp_err_t ret = haptic_play_stop_effect();
+
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG,
+                     "Could not play stop haptic effect: %s",
+                     esp_err_to_name(ret));
+        }
+    }
+
+    return 0;
+}
+
 static int gatt_access_cb(uint16_t conn_handle,
                           uint16_t attr_handle,
                           struct ble_gatt_access_ctxt *ctxt,
@@ -670,6 +1001,10 @@ static int gatt_access_cb(uint16_t conn_handle,
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         return os_mbuf_append(ctxt->om, s_last_command, strlen(s_last_command));
+    }
+
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        return handle_command_write(ctxt);
     }
 
     return BLE_ATT_ERR_UNLIKELY;
@@ -982,6 +1317,10 @@ void app_main(void) {
     if (imu_setup() != ESP_OK) {
         ESP_LOGE(TAG, "Could not find or initialize LSM6DSOX");
         return;
+    }
+
+    if (haptic_setup() != ESP_OK) {
+        ESP_LOGW(TAG, "Haptic init failed; stop feedback buzz disabled");
     }
 
     if (flex_setup() != ESP_OK) {
