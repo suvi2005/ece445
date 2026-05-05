@@ -194,7 +194,3 @@ Finished our demo yesterday!! It went well our professor seemed excited. We reco
 <video controls width="720" src="./media/final-demo-pt1.mp4">
 	Your browser does not support embedded video.
 </video>
-
-<video controls width="720" src="./media/final-demo-pt2.mov">
-	Your browser does not support embedded video.
-</video>
