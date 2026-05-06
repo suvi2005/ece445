@@ -14,6 +14,7 @@
 #define FLEX_SENSOR_ADC_BITWIDTH  ADC_BITWIDTH_12
 #define FLEX_SENSOR_SAMPLE_MS     200
 #define FLEX_SENSOR_AVG_SAMPLES   8
+#define FLEX_SENSOR_READ_ERR_LOG_EVERY 10
 
 typedef struct {
     const char *name;
@@ -21,6 +22,7 @@ typedef struct {
     adc_channel_t channel;
     adc_cali_handle_t cali_handle;
     bool cali_enabled;
+    uint32_t read_fail_count;
 } flex_sensor_t;
 
 static const char *TAG = "flex_sensor";
@@ -117,25 +119,55 @@ static esp_err_t read_sensor_raw_average(adc_oneshot_unit_handle_t adc_handle,
     return ESP_OK;
 }
 
+static int raw_to_percent(int raw)
+{
+    const int raw_max = (1 << 12) - 1;
+
+    if (raw < 0) {
+        raw = 0;
+    } else if (raw > raw_max) {
+        raw = raw_max;
+    }
+
+    return (raw * 100) / raw_max;
+}
+
 static esp_err_t read_and_log_sensor(adc_oneshot_unit_handle_t adc_handle, flex_sensor_t *sensor)
 {
     int raw = 0;
     esp_err_t err = read_sensor_raw_average(adc_handle, sensor->channel, &raw);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "%s read failed: %s", sensor->name, esp_err_to_name(err));
+        sensor->read_fail_count++;
+        if (sensor->read_fail_count == 1 || (sensor->read_fail_count % FLEX_SENSOR_READ_ERR_LOG_EVERY) == 0) {
+            ESP_LOGE(
+                TAG,
+                "%s read failed (%lu): %s",
+                sensor->name,
+                (unsigned long)sensor->read_fail_count,
+                esp_err_to_name(err)
+            );
+        }
         return err;
     }
+
+    if (sensor->read_fail_count > 0) {
+        ESP_LOGW(TAG, "%s recovered after %lu read failures", sensor->name, (unsigned long)sensor->read_fail_count);
+        sensor->read_fail_count = 0;
+    }
+
+    int raw_pct = raw_to_percent(raw);
 
     if (sensor->cali_enabled) {
         int voltage_mv = 0;
         err = adc_cali_raw_to_voltage(sensor->cali_handle, raw, &voltage_mv);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "%s calibration conversion failed: %s", sensor->name, esp_err_to_name(err));
-            return err;
+            ESP_LOGI(TAG, "%s raw=%4d (%3d%%)", sensor->name, raw, raw_pct);
+            return ESP_OK;
         }
-        ESP_LOGI(TAG, "%s raw=%4d voltage=%4d mV", sensor->name, raw, voltage_mv);
+        ESP_LOGI(TAG, "%s raw=%4d (%3d%%) voltage=%4d mV", sensor->name, raw, raw_pct, voltage_mv);
     } else {
-        ESP_LOGI(TAG, "%s raw=%4d", sensor->name, raw);
+        ESP_LOGI(TAG, "%s raw=%4d (%3d%%)", sensor->name, raw, raw_pct);
     }
 
     return ESP_OK;
