@@ -13,6 +13,7 @@
 #define FLEX_SENSOR_ADC_ATTEN     ADC_ATTEN_DB_12
 #define FLEX_SENSOR_ADC_BITWIDTH  ADC_BITWIDTH_12
 #define FLEX_SENSOR_SAMPLE_MS     200
+#define FLEX_SENSOR_AVG_SAMPLES   8
 
 typedef struct {
     const char *name;
@@ -48,6 +49,8 @@ static flex_sensor_t flex_sensors[] = {
     },
 };
 
+#define FLEX_SENSOR_COUNT (sizeof(flex_sensors) / sizeof(flex_sensors[0]))
+
 static bool init_adc_calibration(adc_unit_t unit,
                                  adc_channel_t channel,
                                  adc_atten_t atten,
@@ -74,15 +77,68 @@ static bool init_adc_calibration(adc_unit_t unit,
     };
     err = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
     calibrated = (err == ESP_OK);
+#else
+    (void)unit;
+    (void)channel;
+    (void)atten;
 #endif
 
     if (calibrated) {
         *out_handle = handle;
+        ESP_LOGI(TAG, "ADC calibration enabled for channel %d", channel);
     } else {
         *out_handle = NULL;
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            ESP_LOGW(TAG, "ADC calibration not supported for channel %d", channel);
+        } else {
+            ESP_LOGW(TAG, "ADC calibration unavailable for channel %d (%s)", channel, esp_err_to_name(err));
+        }
     }
 
     return calibrated;
+}
+
+static esp_err_t read_sensor_raw_average(adc_oneshot_unit_handle_t adc_handle,
+                                         adc_channel_t channel,
+                                         int *raw_avg)
+{
+    int raw_sum = 0;
+
+    for (int i = 0; i < FLEX_SENSOR_AVG_SAMPLES; ++i) {
+        int raw = 0;
+        esp_err_t err = adc_oneshot_read(adc_handle, channel, &raw);
+        if (err != ESP_OK) {
+            return err;
+        }
+        raw_sum += raw;
+    }
+
+    *raw_avg = raw_sum / FLEX_SENSOR_AVG_SAMPLES;
+    return ESP_OK;
+}
+
+static esp_err_t read_and_log_sensor(adc_oneshot_unit_handle_t adc_handle, flex_sensor_t *sensor)
+{
+    int raw = 0;
+    esp_err_t err = read_sensor_raw_average(adc_handle, sensor->channel, &raw);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "%s read failed: %s", sensor->name, esp_err_to_name(err));
+        return err;
+    }
+
+    if (sensor->cali_enabled) {
+        int voltage_mv = 0;
+        err = adc_cali_raw_to_voltage(sensor->cali_handle, raw, &voltage_mv);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "%s calibration conversion failed: %s", sensor->name, esp_err_to_name(err));
+            return err;
+        }
+        ESP_LOGI(TAG, "%s raw=%4d voltage=%4d mV", sensor->name, raw, voltage_mv);
+    } else {
+        ESP_LOGI(TAG, "%s raw=%4d", sensor->name, raw);
+    }
+
+    return ESP_OK;
 }
 
 void app_main(void)
@@ -99,7 +155,7 @@ void app_main(void)
         .bitwidth = FLEX_SENSOR_ADC_BITWIDTH,
     };
 
-    for (size_t i = 0; i < sizeof(flex_sensors) / sizeof(flex_sensors[0]); ++i) {
+    for (size_t i = 0; i < FLEX_SENSOR_COUNT; ++i) {
         flex_sensor_t *sensor = &flex_sensors[i];
 
         ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, sensor->channel, &channel_config));
@@ -121,19 +177,9 @@ void app_main(void)
     }
 
     while (true) {
-        for (size_t i = 0; i < sizeof(flex_sensors) / sizeof(flex_sensors[0]); ++i) {
+        for (size_t i = 0; i < FLEX_SENSOR_COUNT; ++i) {
             flex_sensor_t *sensor = &flex_sensors[i];
-            int raw = 0;
-
-            ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, sensor->channel, &raw));
-
-            if (sensor->cali_enabled) {
-                int voltage_mv = 0;
-                ESP_ERROR_CHECK(adc_cali_raw_to_voltage(sensor->cali_handle, raw, &voltage_mv));
-                ESP_LOGI(TAG, "%s raw=%4d voltage=%4d mV", sensor->name, raw, voltage_mv);
-            } else {
-                ESP_LOGI(TAG, "%s raw=%4d", sensor->name, raw);
-            }
+            (void)read_and_log_sensor(adc_handle, sensor);
         }
 
         vTaskDelay(pdMS_TO_TICKS(FLEX_SENSOR_SAMPLE_MS));
