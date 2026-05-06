@@ -121,7 +121,7 @@ static esp_err_t read_sensor_raw_average(adc_oneshot_unit_handle_t adc_handle,
 
 static int raw_to_percent(int raw)
 {
-    const int raw_max = (1 << 12) - 1;
+    const int raw_max = (1 << FLEX_SENSOR_ADC_BITWIDTH) - 1;
 
     if (raw < 0) {
         raw = 0;
@@ -129,7 +129,8 @@ static int raw_to_percent(int raw)
         raw = raw_max;
     }
 
-    return (raw * 100) / raw_max;
+    /* round to nearest percent */
+    return (raw * 100 + raw_max / 2) / raw_max;
 }
 
 static esp_err_t read_and_log_sensor(adc_oneshot_unit_handle_t adc_handle, flex_sensor_t *sensor)
